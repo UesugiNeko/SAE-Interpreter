@@ -4,10 +4,11 @@ import gc
 import json
 import os
 import random
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 import torch
@@ -1082,6 +1083,516 @@ def feature_activations_for_prompt(
     finally:
         del model, tokenizer, sae, input_tokens, cache, resid, acts
         _release_cuda_memory()
+
+
+# -------------------------
+# Explanation quality evaluation
+# -------------------------
+
+
+_EVAL_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "to",
+    "of",
+    "for",
+    "in",
+    "on",
+    "at",
+    "by",
+    "with",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "this",
+    "that",
+    "feature",
+    "token",
+    "tokens",
+    "pattern",
+    "patterns",
+}
+
+
+def _clip_score(value: float) -> float:
+    return float(max(0.0, min(100.0, value)))
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _clean_explanation_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned[:240]
+
+
+def _extract_explanation_keywords(explanation: str, max_keywords: int = 8) -> list[str]:
+    txt = _clean_explanation_text(explanation).lower()
+    if not txt:
+        return []
+    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-']*", txt)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw:
+        t = token.strip("'").lower()
+        if len(t) < 3:
+            continue
+        if t in _EVAL_STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= int(max_keywords):
+            break
+    return out
+
+
+def _generate_default_eval_prompts(
+    explanation: str,
+    keywords: list[str],
+    n_positive: int,
+    n_negative: int,
+    n_neutral: int,
+) -> dict[str, list[str]]:
+    concept = _clean_explanation_text(explanation) or "the target pattern"
+    kw = ", ".join(keywords[:3]) if keywords else concept
+
+    pos_templates = [
+        "Write one short sentence centered on: {concept}.",
+        "Give two concise examples that clearly mention {concept}.",
+        "Continue the text using the theme {concept}:",
+        "Produce a brief explanation that includes {kw}.",
+    ]
+    neg_templates = [
+        "Write one sentence about cooking recipes and kitchen tools.",
+        "Describe a weather report for the next three days.",
+        "Write a sentence about football training and match tactics.",
+        "Describe a travel plan with flights, hotels, and maps.",
+    ]
+    neutral_templates = [
+        "The report opens with a short introduction and then",
+        "In this paragraph, the writer explains that",
+        "A concise summary of the topic is",
+        "The next line in the article says",
+    ]
+
+    def _make_from_templates(templates: list[str], n: int) -> list[str]:
+        rows: list[str] = []
+        for i in range(max(0, int(n))):
+            t = templates[i % len(templates)]
+            rows.append(t.format(concept=concept, kw=kw))
+        return rows
+
+    return {
+        "positive": _make_from_templates(pos_templates, n_positive),
+        "negative": _make_from_templates(neg_templates, n_negative),
+        "neutral": _make_from_templates(neutral_templates, n_neutral),
+    }
+
+
+def generate_eval_prompts(
+    *,
+    explanation: str,
+    n_positive: int,
+    n_negative: int,
+    n_neutral: int,
+    mode: str = "default",
+    llm_prompt_generator: Optional[Callable[[str, int, int, int], dict[str, list[str]]]] = None,
+) -> tuple[dict[str, list[str]], str, Optional[str]]:
+    """
+    Prompt generation entrypoint for explanation-quality evaluation.
+    - default: rule-based templates (no API cost, deterministic shape)
+    - llm: reserved interface; if generator is absent/fails, fallback to default
+    """
+    explanation_text = _clean_explanation_text(explanation)
+    keywords = _extract_explanation_keywords(explanation_text)
+    requested = str(mode or "default").strip().lower()
+
+    if requested == "llm":
+        if callable(llm_prompt_generator):
+            try:
+                rows = llm_prompt_generator(explanation_text, int(n_positive), int(n_negative), int(n_neutral))
+                if (
+                    isinstance(rows, dict)
+                    and isinstance(rows.get("positive"), list)
+                    and isinstance(rows.get("negative"), list)
+                    and isinstance(rows.get("neutral"), list)
+                ):
+                    return rows, "llm", None
+            except Exception as exc:
+                warn = f"LLM prompt generation failed: {type(exc).__name__}: {exc}. Fallback to default."
+                return (
+                    _generate_default_eval_prompts(explanation_text, keywords, n_positive, n_negative, n_neutral),
+                    "default_fallback",
+                    warn,
+                )
+        return (
+            _generate_default_eval_prompts(explanation_text, keywords, n_positive, n_negative, n_neutral),
+            "default_fallback",
+            "LLM prompt-generation interface is reserved and not configured. Fallback to default.",
+        )
+
+    return (
+        _generate_default_eval_prompts(explanation_text, keywords, n_positive, n_negative, n_neutral),
+        "default",
+        None,
+    )
+
+
+def _keyword_hit_count(text: str, keywords: list[str]) -> int:
+    low = str(text or "").lower()
+    if not low or not keywords:
+        return 0
+    hits = 0
+    for kw in keywords:
+        if kw and kw in low:
+            hits += 1
+    return hits
+
+
+def _next_token_overlap(top_next_tokens: list[dict[str, Any]], keywords: list[str]) -> int:
+    if not top_next_tokens or not keywords:
+        return 0
+    joined = " ".join(str(r.get("token", "")) for r in top_next_tokens).lower()
+    if not joined:
+        return 0
+    return sum(1 for kw in keywords if kw in joined)
+
+
+def _grade_from_score(score: float) -> str:
+    s = float(score)
+    if s >= 85.0:
+        return "A"
+    if s >= 70.0:
+        return "B"
+    if s >= 55.0:
+        return "C"
+    if s >= 40.0:
+        return "D"
+    return "E"
+
+
+def _set_global_seed(seed: int) -> None:
+    random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+@torch.no_grad()
+def _prompt_feature_activation_with_loaded(
+    *,
+    model,
+    tokenizer,
+    sae,
+    hook_name: str,
+    sae_device: str,
+    feature_id: int,
+    prompt_text: str,
+) -> dict[str, Any]:
+    if not prompt_text.strip():
+        raise ValueError("prompt_text is empty.")
+
+    input_tokens = None
+    cache = None
+    resid = None
+    acts = None
+    try:
+        # Keep behavior aligned with prompt-centric flow: no BOS prepend.
+        input_tokens = model.to_tokens(prompt_text, prepend_bos=False).to(model.cfg.device)
+        if input_tokens.numel() == 0:
+            raise ValueError("Prompt produced empty token sequence after tokenization.")
+
+        _, cache = model.run_with_cache(input_tokens, names_filter=lambda name: name == hook_name)
+        resid = cache[hook_name]
+        resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
+        acts = sae.encode(resid_for_sae)
+        if acts.ndim != 3:
+            raise ValueError(f"Unexpected acts shape: {tuple(acts.shape)}")
+        if feature_id < 0 or feature_id >= acts.shape[-1]:
+            raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
+
+        feat_acts_t = acts[0, :, feature_id].detach().float().cpu()
+        token_ids = [int(x) for x in input_tokens[0].detach().cpu().tolist()]
+        tokens = [tokenizer.decode([tid], clean_up_tokenization_spaces=False) for tid in token_ids]
+        feat_acts = [float(x) for x in feat_acts_t.tolist()]
+        max_idx = int(torch.argmax(feat_acts_t).item()) if feat_acts else -1
+        max_val = float(feat_acts_t[max_idx].item()) if max_idx >= 0 else 0.0
+        max_tok = tokens[max_idx] if max_idx >= 0 and max_idx < len(tokens) else ""
+        return {
+            "max_activation": max_val,
+            "max_token": max_tok,
+            "max_token_index": max_idx,
+            "record": {"token_ids": token_ids, "tokens": tokens, "feat_acts": feat_acts},
+        }
+    finally:
+        del input_tokens, cache, resid, acts
+
+
+@torch.no_grad()
+def _steer_feature_with_loaded(
+    *,
+    model,
+    tokenizer,
+    sae,
+    hook_name: str,
+    sae_device: str,
+    feature_id: int,
+    prompt_text: str,
+    steer_strength: float,
+    max_new_tokens: int,
+    top_k_next_tokens: int,
+) -> dict[str, Any]:
+    if not prompt_text.strip():
+        raise ValueError("prompt_text is empty.")
+
+    input_tokens = None
+    steered_logits = None
+    steered_next = None
+    steered_gen = None
+    try:
+        input_tokens = model.to_tokens(prompt_text).to(model.cfg.device)
+
+        def _steer_hook(resid, hook):  # noqa: ARG001
+            resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
+            acts = sae.encode(resid_for_sae)
+            if feature_id < 0 or feature_id >= acts.shape[-1]:
+                raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
+            acts[..., feature_id] = acts[..., feature_id] + float(steer_strength)
+            decoded = sae.decode(acts)
+            return decoded.to(resid.device) if str(decoded.device) != str(resid.device) else decoded
+
+        steered_logits = model.run_with_hooks(input_tokens, fwd_hooks=[(hook_name, _steer_hook)])
+        steered_next = steered_logits[0, -1, :]
+        steered_gen = _generate_with_optional_hook(
+            model,
+            input_tokens,
+            max_new_tokens=int(max_new_tokens),
+            hook_name=hook_name,
+            hook_fn=_steer_hook,
+        )
+        steered_text = tokenizer.decode(steered_gen[0].tolist(), clean_up_tokenization_spaces=False)
+        steered_top = _top_next_tokens(steered_next, tokenizer, k=int(top_k_next_tokens))
+        return {
+            "steered_generated_text": steered_text,
+            "steered_top_next_tokens": steered_top,
+        }
+    finally:
+        del input_tokens, steered_logits, steered_next, steered_gen
+
+
+def evaluate_feature_explanation_quality(
+    *,
+    feature_id: int,
+    explanation_text: str,
+    model_path: str,
+    tokenizer_path: Optional[str],
+    sae_path: str,
+    device: str = "auto",
+    sample_generation_mode: str = "default",
+    n_positive: int = 3,
+    n_negative: int = 3,
+    n_neutral: int = 2,
+    steer_strength: float = 100.0,
+    steer_max_new_tokens: int = 32,
+    steer_top_k_next_tokens: int = 10,
+    seed: int = 42,
+    llm_prompt_generator: Optional[Callable[[str, int, int, int], dict[str, list[str]]]] = None,
+) -> dict[str, Any]:
+    """
+    Evaluate explanation quality using two non-LLM executable tests:
+    1) Prompt-activation separation between positive and negative generated prompts.
+    2) Steering directional test on neutral prompts (+strength vs -strength).
+    """
+    explanation = _clean_explanation_text(explanation_text)
+    if not explanation:
+        raise ValueError("Explanation text is empty.")
+    if not model_path or not sae_path:
+        raise ValueError("model_path and sae_path are required.")
+
+    warnings: list[str] = []
+    keywords = _extract_explanation_keywords(explanation)
+    prompts, generation_mode_used, generation_warn = generate_eval_prompts(
+        explanation=explanation,
+        n_positive=int(n_positive),
+        n_negative=int(n_negative),
+        n_neutral=int(n_neutral),
+        mode=sample_generation_mode,
+        llm_prompt_generator=llm_prompt_generator,
+    )
+    if generation_warn:
+        warnings.append(generation_warn)
+
+    activation_rows: list[dict[str, Any]] = []
+    positive_values: list[float] = []
+    negative_values: list[float] = []
+    steer_rows: list[dict[str, Any]] = []
+    steer_case_scores: list[float] = []
+    abs_strength = abs(float(steer_strength))
+    device_plan: dict[str, Any] = {}
+    model_device = "cpu"
+    sae_device = "cpu"
+
+    model = None
+    tokenizer = None
+    sae = None
+    try:
+        _set_global_seed(int(seed))
+        model_device, sae_device, device_plan = _resolve_device_pair(device, max_devices=2)
+        model, tokenizer = _load_hooked_model(
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
+            device=model_device,
+        )
+        sae = _load_sae(sae_path=sae_path, device=sae_device)
+        hook_name = _get_hook_name_from_sae(sae)
+
+        for label in ("positive", "negative"):
+            for prompt in prompts.get(label, []):
+                try:
+                    out = _prompt_feature_activation_with_loaded(
+                        model=model,
+                        tokenizer=tokenizer,
+                        sae=sae,
+                        hook_name=hook_name,
+                        sae_device=sae_device,
+                        feature_id=int(feature_id),
+                        prompt_text=str(prompt),
+                    )
+                    max_act = float(out.get("max_activation", 0.0))
+                    activation_rows.append(
+                        {
+                            "label": label,
+                            "prompt": str(prompt),
+                            "max_activation": max_act,
+                            "max_token": str(out.get("max_token", "")),
+                        }
+                    )
+                    if label == "positive":
+                        positive_values.append(max_act)
+                    else:
+                        negative_values.append(max_act)
+                except Exception as exc:
+                    warnings.append(f"Prompt-activation test failed ({label}): {type(exc).__name__}: {exc}")
+
+        for prompt in prompts.get("neutral", []):
+            try:
+                pos_res = _steer_feature_with_loaded(
+                    model=model,
+                    tokenizer=tokenizer,
+                    sae=sae,
+                    hook_name=hook_name,
+                    sae_device=sae_device,
+                    feature_id=int(feature_id),
+                    prompt_text=str(prompt),
+                    steer_strength=abs_strength,
+                    max_new_tokens=int(steer_max_new_tokens),
+                    top_k_next_tokens=int(steer_top_k_next_tokens),
+                )
+                neg_res = _steer_feature_with_loaded(
+                    model=model,
+                    tokenizer=tokenizer,
+                    sae=sae,
+                    hook_name=hook_name,
+                    sae_device=sae_device,
+                    feature_id=int(feature_id),
+                    prompt_text=str(prompt),
+                    steer_strength=-abs_strength,
+                    max_new_tokens=int(steer_max_new_tokens),
+                    top_k_next_tokens=int(steer_top_k_next_tokens),
+                )
+                pos_text = str(pos_res.get("steered_generated_text", ""))
+                neg_text = str(neg_res.get("steered_generated_text", ""))
+                pos_hits = _keyword_hit_count(pos_text, keywords)
+                neg_hits = _keyword_hit_count(neg_text, keywords)
+                pos_next_overlap = _next_token_overlap(pos_res.get("steered_top_next_tokens", []), keywords)
+                neg_next_overlap = _next_token_overlap(neg_res.get("steered_top_next_tokens", []), keywords)
+                directional_raw = (pos_hits - neg_hits) * 2 + (pos_next_overlap - neg_next_overlap)
+                case_score = _clip_score(50.0 + 15.0 * float(directional_raw))
+                steer_case_scores.append(case_score)
+                steer_rows.append(
+                    {
+                        "prompt": str(prompt),
+                        "positive_steer_text": pos_text,
+                        "negative_steer_text": neg_text,
+                        "positive_keyword_hits": int(pos_hits),
+                        "negative_keyword_hits": int(neg_hits),
+                        "positive_next_overlap": int(pos_next_overlap),
+                        "negative_next_overlap": int(neg_next_overlap),
+                        "case_score": case_score,
+                    }
+                )
+            except Exception as exc:
+                warnings.append(f"Steer test failed: {type(exc).__name__}: {exc}")
+    finally:
+        del model, tokenizer, sae
+        _release_cuda_memory()
+
+    pos_mean = _mean(positive_values)
+    neg_mean = _mean(negative_values)
+    if positive_values and negative_values:
+        sep_ratio = (pos_mean - neg_mean) / (abs(pos_mean) + abs(neg_mean) + 1e-8)
+        sep_score = _clip_score((sep_ratio + 1.0) * 50.0)
+        threshold = (pos_mean + neg_mean) * 0.5
+        pos_hit = sum(1 for x in positive_values if x > threshold) / len(positive_values)
+        neg_hit = sum(1 for x in negative_values if x < threshold) / len(negative_values)
+        hit_score = _clip_score((pos_hit + neg_hit) * 50.0)
+        activation_score = _clip_score(0.7 * sep_score + 0.3 * hit_score)
+    else:
+        sep_ratio = 0.0
+        sep_score = 0.0
+        hit_score = 0.0
+        activation_score = 0.0
+        warnings.append("Insufficient positive/negative prompt activation results for robust activation score.")
+
+    if steer_case_scores:
+        steer_score = _clip_score(_mean(steer_case_scores))
+    else:
+        steer_score = 0.0
+        warnings.append("No valid steering cases available; steer score set to 0.")
+
+    consistency_bonus = 5.0 if (activation_score >= 60.0 and steer_score >= 60.0) else 0.0
+    final_score = _clip_score(0.65 * activation_score + 0.35 * steer_score + consistency_bonus)
+
+    return {
+        "feature_id": int(feature_id),
+        "explanation_text": explanation,
+        "keywords": keywords,
+        "sample_generation_mode_requested": str(sample_generation_mode),
+        "sample_generation_mode_used": generation_mode_used,
+        "eval_runtime": {
+            "device_requested": str(device),
+            "model_device": model_device,
+            "sae_device": sae_device,
+            "device_plan": device_plan,
+        },
+        "samples": prompts,
+        "activation_tests": activation_rows,
+        "steer_tests": steer_rows,
+        "metrics": {
+            "positive_mean_activation": pos_mean,
+            "negative_mean_activation": neg_mean,
+            "activation_separation_ratio": sep_ratio,
+            "activation_separation_score": sep_score,
+            "activation_hit_score": hit_score,
+            "activation_score": activation_score,
+            "steer_score": steer_score,
+            "consistency_bonus": consistency_bonus,
+            "final_score": final_score,
+            "grade": _grade_from_score(final_score),
+        },
+        "warnings": warnings,
+    }
 
 
 # -------------------------

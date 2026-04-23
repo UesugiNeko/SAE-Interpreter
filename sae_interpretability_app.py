@@ -23,6 +23,7 @@ from sae_ui_backend import (
     FeatureDataBundle,
     build_sequence_activation_html,
     discover_sae_paths,
+    evaluate_feature_explanation_quality,
     feature_activations_for_prompt,
     find_features_for_token_query,
     generate_feature_explanation,
@@ -269,6 +270,8 @@ def _init_state() -> None:
         "runtime_sae_path": "",
         "runtime_device": "auto",
         "source_mode": "Load existing data",
+        "eval_result_cache_load": {},
+        "eval_result_cache_infer": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -392,6 +395,12 @@ def _cache_names(mode_key: str) -> tuple[str, str]:
     if mode_key == "load":
         return "explain_cache_load", "explain_result_cache_load"
     return "explain_cache_infer", "explain_result_cache_infer"
+
+
+def _eval_cache_name(mode_key: str) -> str:
+    if mode_key == "load":
+        return "eval_result_cache_load"
+    return "eval_result_cache_infer"
 
 
 def _ensure_api_defaults() -> None:
@@ -1295,7 +1304,7 @@ def _render_prompt_activation_panel(
 
 
 def _render_function_menu(mode_key: str) -> str:
-    options = ["Feature Explorer", "Explain", "Token Search", "Steer", "Data Summary"]
+    options = ["Feature Explorer", "Explain", "Token Search", "Steer", "Explanation Eval", "Data Summary"]
     state_key = f"menu_{mode_key}"
     selected = st.session_state.get(state_key, options[0])
     if selected not in options:
@@ -1306,7 +1315,7 @@ def _render_function_menu(mode_key: str) -> str:
     st.markdown("<div class='function-menu-title'>Function Menu</div>", unsafe_allow_html=True)
 
     row1 = options[:3]
-    row2 = options[3:]
+    row2 = options[3:6]
 
     cols1 = st.columns(3)
     for idx, opt in enumerate(row1):
@@ -1321,7 +1330,7 @@ def _render_function_menu(mode_key: str) -> str:
                     st.session_state[state_key] = opt
                     st.rerun()
 
-    cols2 = st.columns(2)
+    cols2 = st.columns(3)
     for idx, opt in enumerate(row2):
         with cols2[idx]:
             if st.button(
@@ -1336,6 +1345,178 @@ def _render_function_menu(mode_key: str) -> str:
 
     st.markdown("</div>", unsafe_allow_html=True)
     return st.session_state.get(state_key, selected)
+
+
+def _render_explanation_eval_panel(bundle: FeatureDataBundle, feature_id: int, mode_key: str) -> None:
+    st.subheader("Explanation Quality Eval")
+    st.caption("Default mode: rule-based sample generation + Prompt Activation and Steer scoring. LLM generation interface is reserved.")
+
+    meta = bundle.metadata or {}
+    default_model = str(meta.get("model_path", DEFAULT_TOKENIZER_PATH))
+    default_tokenizer = str(meta.get("tokenizer_path", DEFAULT_TOKENIZER_PATH))
+    default_sae = str(meta.get("sae_path", ""))
+    default_device = str(meta.get("device", "auto"))
+    _init_runtime_widget_state(default_sae_path=default_sae, default_device=default_device)
+
+    cache_name, _ = _cache_names(mode_key)
+    explain_cache = st.session_state.get(cache_name, {})
+    cached_explanations = {
+        method: str(txt)
+        for (fid, method), txt in explain_cache.items()
+        if int(fid) == int(feature_id)
+    }
+
+    if cached_explanations:
+        methods = list(cached_explanations.keys())
+        selected_method = st.selectbox(
+            "Explanation source",
+            options=methods + ["manual"],
+            index=0,
+            key=f"eval_source_{mode_key}_{feature_id}",
+        )
+        default_expl = cached_explanations.get(selected_method, "") if selected_method != "manual" else ""
+    else:
+        st.info("No cached explanation found for this feature. You can paste one manually.")
+        default_expl = ""
+
+    explanation_text = st.text_area(
+        "Explanation text",
+        value=default_expl,
+        height=90,
+        key=f"eval_expl_text_{mode_key}_{feature_id}",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        model_path = st.text_input("Model path/name", value=default_model, key=f"eval_model_{mode_key}")
+        tokenizer_path = st.text_input("Tokenizer path/name", value=default_tokenizer, key=f"eval_tok_{mode_key}")
+    with c2:
+        sae_path = st.text_input(
+            "SAE path",
+            key="runtime_sae_path_ui",
+            value=str(st.session_state.get("runtime_sae_path", default_sae)),
+        )
+        device = _device_selectbox(
+            "Device",
+            key="runtime_device_ui",
+            default=str(st.session_state.get("runtime_device", default_device)),
+        )
+    _sync_runtime_widget_to_store()
+
+    cg1, cg2, cg3 = st.columns(3)
+    with cg1:
+        n_positive = st.number_input("Positive samples", min_value=1, max_value=8, value=3, key=f"eval_npos_{mode_key}")
+        n_negative = st.number_input("Negative samples", min_value=1, max_value=8, value=3, key=f"eval_nneg_{mode_key}")
+    with cg2:
+        n_neutral = st.number_input("Neutral samples", min_value=1, max_value=6, value=2, key=f"eval_nneu_{mode_key}")
+        steer_strength = st.number_input("Steer strength", min_value=-300.0, max_value=300.0, value=100.0, step=1.0, key=f"eval_strength_{mode_key}")
+    with cg3:
+        steer_max_new_tokens = st.number_input("Steer max new tokens", min_value=1, max_value=96, value=32, key=f"eval_newtok_{mode_key}")
+        sample_gen_mode = st.selectbox(
+            "Sample generation",
+            options=["default", "llm"],
+            index=0,
+            key=f"eval_gen_mode_{mode_key}",
+            help="`llm` is a reserved interface. If not configured in backend, it will fallback to default.",
+        )
+
+    eval_cache_name = _eval_cache_name(mode_key)
+    eval_cache = st.session_state.get(eval_cache_name, {})
+    cached_eval = eval_cache.get(int(feature_id))
+    if cached_eval:
+        m = cached_eval.get("metrics", {})
+        st.markdown(
+            f"<div class='metric-card'><div class='k'>Cached Final Score</div><div class='v'>{float(m.get('final_score', 0.0)):.1f} / 100 ({_esc_html(m.get('grade', 'N/A'))})</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    if st.button("Run Explanation Eval"):
+        if not explanation_text.strip():
+            st.error("Please provide explanation text (or generate one in Explain panel first).")
+            return
+        if not model_path.strip() or not sae_path.strip():
+            st.error("Model path and SAE path are required.")
+            return
+        try:
+            with st.spinner("Running explanation quality evaluation..."):
+                result = evaluate_feature_explanation_quality(
+                    feature_id=int(feature_id),
+                    explanation_text=explanation_text,
+                    model_path=model_path,
+                    tokenizer_path=tokenizer_path,
+                    sae_path=sae_path,
+                    device=device,
+                    sample_generation_mode=sample_gen_mode,
+                    n_positive=int(n_positive),
+                    n_negative=int(n_negative),
+                    n_neutral=int(n_neutral),
+                    steer_strength=float(steer_strength),
+                    steer_max_new_tokens=int(steer_max_new_tokens),
+                    steer_top_k_next_tokens=10,
+                    seed=42,
+                )
+            st.session_state[eval_cache_name][int(feature_id)] = result
+            cached_eval = result
+            st.success("Explanation evaluation completed.")
+        except Exception as exc:
+            st.error(f"Explanation evaluation failed: {exc}")
+
+    cached_eval = st.session_state.get(eval_cache_name, {}).get(int(feature_id))
+    if not cached_eval:
+        st.info("No evaluation result for this feature yet.")
+        return
+
+    metrics = cached_eval.get("metrics", {})
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        st.markdown(
+            f"<div class='metric-card'><div class='k'>Final Score</div><div class='v'>{float(metrics.get('final_score', 0.0)):.1f}</div></div>",
+            unsafe_allow_html=True,
+        )
+    with mc2:
+        st.markdown(
+            f"<div class='metric-card'><div class='k'>Activation Score</div><div class='v'>{float(metrics.get('activation_score', 0.0)):.1f}</div></div>",
+            unsafe_allow_html=True,
+        )
+    with mc3:
+        st.markdown(
+            f"<div class='metric-card'><div class='k'>Steer Score</div><div class='v'>{float(metrics.get('steer_score', 0.0)):.1f} ({_esc_html(metrics.get('grade', 'N/A'))})</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    warnings = cached_eval.get("warnings", [])
+    if warnings:
+        with st.expander("Warnings"):
+            for w in warnings:
+                st.warning(str(w))
+
+    samples = cached_eval.get("samples", {})
+    st.markdown("#### Generated Test Samples")
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.markdown("**Positive**")
+        for p in samples.get("positive", []):
+            st.caption(p)
+    with t2:
+        st.markdown("**Negative**")
+        for p in samples.get("negative", []):
+            st.caption(p)
+    with t3:
+        st.markdown("**Neutral**")
+        for p in samples.get("neutral", []):
+            st.caption(p)
+
+    act_rows = cached_eval.get("activation_tests", [])
+    steer_rows = cached_eval.get("steer_tests", [])
+    if act_rows:
+        st.markdown("#### Prompt Activation Tests")
+        st.dataframe(pd.DataFrame(act_rows), use_container_width=True)
+    if steer_rows:
+        st.markdown("#### Steer Direction Tests")
+        st.dataframe(pd.DataFrame(steer_rows), use_container_width=True)
+
+    with st.expander("Raw eval payload"):
+        st.json(cached_eval)
 
 
 def _render_steer_panel(bundle: FeatureDataBundle, feature_id: int, mode_key: str) -> None:
@@ -1372,7 +1553,7 @@ def _render_steer_panel(bundle: FeatureDataBundle, feature_id: int, mode_key: st
         st.caption("No cached explanation yet. Generate one in the Explain panel first.")
 
     prompt_text = st.text_area("Input prompt", value="The city of Paris is", height=120)
-    steer_strength = st.slider("Activation steering strength", min_value=-200.0, max_value=200.0, value=20.0, step=1.0)
+    steer_strength = st.slider("Activation steering strength", min_value=-300.0, max_value=300.0, value=100.0, step=1.0)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1531,6 +1712,8 @@ def main() -> None:
         _render_token_search(bundle, mode_key=mode_key)
     elif menu == "Steer":
         _render_steer_panel(bundle, int(selected_feature), mode_key=mode_key)
+    elif menu == "Explanation Eval":
+        _render_explanation_eval_panel(bundle, int(selected_feature), mode_key=mode_key)
     else:
         _render_data_summary(bundle, mode_key=mode_key)
 
