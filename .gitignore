@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Env / IDE
+.env
+.venv/
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+graduate/.uploaded_cache/
+
+# data weights 
+*.pt
+*.ptwe
+*.pth
+*.bin
+*.safetensors
+*.parquet
+
+# result
+*.png
+*.html
+*.json
+*.pkl
+*.doc
+
+# temp py
+gpt_lens.py
+logitlens_test.py
+saeboard_test.py
+utils.py
+
