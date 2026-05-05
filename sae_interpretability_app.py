@@ -1419,6 +1419,17 @@ def _render_explanation_eval_panel(bundle: FeatureDataBundle, feature_id: int, m
             key=f"eval_gen_mode_{mode_key}",
             help="`llm` is a reserved interface. If not configured in backend, it will fallback to default.",
         )
+    steer_method = st.selectbox(
+        "Steer method",
+        options=["simple_additive", "orthogonal_decomp", "projection_cap"],
+        index=0,
+        key=f"eval_steer_method_{mode_key}",
+        format_func=lambda x: {
+            "simple_additive": "simple additive",
+            "orthogonal_decomp": "orthogonal decomp",
+            "projection_cap": "projection cap",
+        }.get(str(x), str(x)),
+    )
 
     eval_cache_name = _eval_cache_name(mode_key)
     eval_cache = st.session_state.get(eval_cache_name, {})
@@ -1451,6 +1462,7 @@ def _render_explanation_eval_panel(bundle: FeatureDataBundle, feature_id: int, m
                     n_negative=int(n_negative),
                     n_neutral=int(n_neutral),
                     steer_strength=float(steer_strength),
+                    steer_method=str(steer_method),
                     steer_max_new_tokens=int(steer_max_new_tokens),
                     steer_top_k_next_tokens=10,
                     seed=42,
@@ -1554,6 +1566,17 @@ def _render_steer_panel(bundle: FeatureDataBundle, feature_id: int, mode_key: st
 
     prompt_text = st.text_area("Input prompt", value="The city of Paris is", height=120)
     steer_strength = st.slider("Activation steering strength", min_value=-300.0, max_value=300.0, value=100.0, step=1.0)
+    steer_method = st.selectbox(
+        "Steer method",
+        options=["simple_additive", "orthogonal_decomp", "projection_cap"],
+        index=0,
+        key=f"steer_method_{mode_key}",
+        format_func=lambda x: {
+            "simple_additive": "simple additive",
+            "orthogonal_decomp": "orthogonal decomp",
+            "projection_cap": "projection cap",
+        }.get(str(x), str(x)),
+    )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1591,6 +1614,7 @@ def _render_steer_panel(bundle: FeatureDataBundle, feature_id: int, mode_key: st
                     feature_id=int(feature_id),
                     prompt_text=prompt_text,
                     steer_strength=float(steer_strength),
+                    steer_method=str(steer_method),
                     device=device,
                     max_new_tokens=int(max_new_tokens),
                     top_k_next_tokens=int(top_k_next),

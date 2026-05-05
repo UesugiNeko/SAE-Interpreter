@@ -872,6 +872,63 @@ def _generate_with_optional_hook(
     return out
 
 
+_STEER_METHOD_ALIASES = {
+    "simple_additive": "simple_additive",
+    "simple additive": "simple_additive",
+    "SIMPLE_ADDITIVE": "simple_additive",
+    "orthogonal_decomp": "orthogonal_decomp",
+    "orthogonal decomp": "orthogonal_decomp",
+    "ORTHOGONAL_DECOMP": "orthogonal_decomp",
+    "projection_cap": "projection_cap",
+    "projection cap": "projection_cap",
+    "PROJECTION_CAP": "projection_cap",
+}
+
+
+def _normalize_steer_method(method: Optional[str]) -> str:
+    key = str(method or "simple_additive").strip()
+    if key in _STEER_METHOD_ALIASES:
+        return _STEER_METHOD_ALIASES[key]
+    lower = key.lower()
+    if lower in _STEER_METHOD_ALIASES:
+        return _STEER_METHOD_ALIASES[lower]
+    raise ValueError(
+        f"Unknown steer method: {method}. "
+        "Expected one of: simple_additive, orthogonal_decomp, projection_cap"
+    )
+
+
+def _apply_residual_steering_method(
+    *,
+    resid: torch.Tensor,
+    steering_vector: torch.Tensor,
+    steer_strength: float,
+    steer_method: str,
+) -> torch.Tensor:
+    method = _normalize_steer_method(steer_method)
+    vec = steering_vector.to(device=resid.device, dtype=resid.dtype)
+    norm_sq = torch.sum(vec * vec)
+    if not torch.isfinite(norm_sq) or float(norm_sq.item()) <= 0.0:
+        raise ValueError("Steering vector has invalid norm for residual steering.")
+
+    if method == "orthogonal_decomp":
+        proj_coeff = torch.einsum("...d,d->...", resid, vec) / norm_sq
+        proj = proj_coeff.unsqueeze(-1) * vec
+        return resid + (float(steer_strength) - 1.0) * proj
+
+    if method == "projection_cap":
+        unit = vec / torch.sqrt(norm_sq)
+        proj = torch.einsum("...d,d->...", resid, unit)
+        s = float(steer_strength)
+        if s >= 0.0:
+            capped = torch.clamp(proj, max=s)
+        else:
+            capped = torch.clamp(proj, min=s)
+        return resid + (capped - proj).unsqueeze(-1) * unit
+
+    raise ValueError(f"Residual steering is not defined for method: {steer_method}")
+
+
 def steer_feature_on_text(
     *,
     model_path: str,
@@ -880,6 +937,7 @@ def steer_feature_on_text(
     feature_id: int,
     prompt_text: str,
     steer_strength: float,
+    steer_method: str = "simple_additive",
     device: str = "auto",
     max_new_tokens: int = 24,
     top_k_next_tokens: int = 10,
@@ -888,6 +946,7 @@ def steer_feature_on_text(
     Apply simple feature steering by adding `steer_strength` to the selected SAE feature activation
     at the SAE hook point, then compare baseline vs steered next-token logits and continuation.
     """
+    steer_method_used = _normalize_steer_method(steer_method)
     model_device, sae_device, device_plan = _resolve_device_pair(device, max_devices=2)
     model = None
     tokenizer = None
@@ -918,13 +977,24 @@ def steer_feature_on_text(
 
         # Steering hook
         def _steer_hook(resid, hook):  # noqa: ARG001
-            resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
-            acts = sae.encode(resid_for_sae)
-            if feature_id < 0 or feature_id >= acts.shape[-1]:
-                raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
-            acts[..., feature_id] = acts[..., feature_id] + steer_strength
-            decoded = sae.decode(acts)
-            return decoded.to(resid.device) if str(decoded.device) != str(resid.device) else decoded
+            if steer_method_used == "simple_additive":
+                resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
+                acts = sae.encode(resid_for_sae)
+                if feature_id < 0 or feature_id >= acts.shape[-1]:
+                    raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
+                acts[..., feature_id] = acts[..., feature_id] + steer_strength
+                decoded = sae.decode(acts)
+                return decoded.to(resid.device) if str(decoded.device) != str(resid.device) else decoded
+
+            if feature_id < 0 or feature_id >= int(sae.W_dec.shape[0]):
+                raise ValueError(f"feature_id={feature_id} out of range [0, {int(sae.W_dec.shape[0]) - 1}]")
+            steer_vec = sae.W_dec[int(feature_id)]
+            return _apply_residual_steering_method(
+                resid=resid,
+                steering_vector=steer_vec,
+                steer_strength=float(steer_strength),
+                steer_method=steer_method_used,
+            )
 
         steered_logits = model.run_with_hooks(input_tokens, fwd_hooks=[(hook_name, _steer_hook)])
         steered_next = steered_logits[0, -1, :]
@@ -945,6 +1015,7 @@ def steer_feature_on_text(
             "feature_id": feature_id,
             "prompt_text": prompt_text,
             "steer_strength": steer_strength,
+            "steer_method": steer_method_used,
             "hook_name": hook_name,
             "device": model_device,
             "sae_device": sae_device,
@@ -1350,6 +1421,7 @@ def _steer_feature_with_loaded(
     feature_id: int,
     prompt_text: str,
     steer_strength: float,
+    steer_method: str = "simple_additive",
     max_new_tokens: int,
     top_k_next_tokens: int,
 ) -> dict[str, Any]:
@@ -1360,17 +1432,29 @@ def _steer_feature_with_loaded(
     steered_logits = None
     steered_next = None
     steered_gen = None
+    steer_method_used = _normalize_steer_method(steer_method)
     try:
         input_tokens = model.to_tokens(prompt_text).to(model.cfg.device)
 
         def _steer_hook(resid, hook):  # noqa: ARG001
-            resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
-            acts = sae.encode(resid_for_sae)
-            if feature_id < 0 or feature_id >= acts.shape[-1]:
-                raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
-            acts[..., feature_id] = acts[..., feature_id] + float(steer_strength)
-            decoded = sae.decode(acts)
-            return decoded.to(resid.device) if str(decoded.device) != str(resid.device) else decoded
+            if steer_method_used == "simple_additive":
+                resid_for_sae = resid.to(sae_device) if str(sae_device) != str(resid.device) else resid
+                acts = sae.encode(resid_for_sae)
+                if feature_id < 0 or feature_id >= acts.shape[-1]:
+                    raise ValueError(f"feature_id={feature_id} out of range [0, {acts.shape[-1]-1}]")
+                acts[..., feature_id] = acts[..., feature_id] + float(steer_strength)
+                decoded = sae.decode(acts)
+                return decoded.to(resid.device) if str(decoded.device) != str(resid.device) else decoded
+
+            if feature_id < 0 or feature_id >= int(sae.W_dec.shape[0]):
+                raise ValueError(f"feature_id={feature_id} out of range [0, {int(sae.W_dec.shape[0]) - 1}]")
+            steer_vec = sae.W_dec[int(feature_id)]
+            return _apply_residual_steering_method(
+                resid=resid,
+                steering_vector=steer_vec,
+                steer_strength=float(steer_strength),
+                steer_method=steer_method_used,
+            )
 
         steered_logits = model.run_with_hooks(input_tokens, fwd_hooks=[(hook_name, _steer_hook)])
         steered_next = steered_logits[0, -1, :]
@@ -1384,6 +1468,7 @@ def _steer_feature_with_loaded(
         steered_text = tokenizer.decode(steered_gen[0].tolist(), clean_up_tokenization_spaces=False)
         steered_top = _top_next_tokens(steered_next, tokenizer, k=int(top_k_next_tokens))
         return {
+            "steer_method": steer_method_used,
             "steered_generated_text": steered_text,
             "steered_top_next_tokens": steered_top,
         }
@@ -1404,6 +1489,7 @@ def evaluate_feature_explanation_quality(
     n_negative: int = 3,
     n_neutral: int = 2,
     steer_strength: float = 100.0,
+    steer_method: str = "simple_additive",
     steer_max_new_tokens: int = 32,
     steer_top_k_next_tokens: int = 10,
     seed: int = 42,
@@ -1439,6 +1525,7 @@ def evaluate_feature_explanation_quality(
     steer_rows: list[dict[str, Any]] = []
     steer_case_scores: list[float] = []
     abs_strength = abs(float(steer_strength))
+    steer_method_used = _normalize_steer_method(steer_method)
     device_plan: dict[str, Any] = {}
     model_device = "cpu"
     sae_device = "cpu"
@@ -1496,6 +1583,7 @@ def evaluate_feature_explanation_quality(
                     feature_id=int(feature_id),
                     prompt_text=str(prompt),
                     steer_strength=abs_strength,
+                    steer_method=steer_method_used,
                     max_new_tokens=int(steer_max_new_tokens),
                     top_k_next_tokens=int(steer_top_k_next_tokens),
                 )
@@ -1508,6 +1596,7 @@ def evaluate_feature_explanation_quality(
                     feature_id=int(feature_id),
                     prompt_text=str(prompt),
                     steer_strength=-abs_strength,
+                    steer_method=steer_method_used,
                     max_new_tokens=int(steer_max_new_tokens),
                     top_k_next_tokens=int(steer_top_k_next_tokens),
                 )
@@ -1574,6 +1663,7 @@ def evaluate_feature_explanation_quality(
             "device_requested": str(device),
             "model_device": model_device,
             "sae_device": sae_device,
+            "steer_method": steer_method_used,
             "device_plan": device_plan,
         },
         "samples": prompts,
